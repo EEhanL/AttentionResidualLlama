@@ -15,9 +15,9 @@ DEFAULT_SOURCES = {
 }
 
 DEFAULT_RATIOS = {
-    "zh": 4,
-    "en": 3,
-    "nl": 3,
+    "zh": 1,
+    "en": 1,
+    "nl": 1,
 }
 
 
@@ -46,7 +46,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
-        default="./data/merged_multilingual_zh4_en3_nl3_100m.bin",
+        default="./data/merged_multilingual_zh1_en1_nl1_100m.bin",
         help="Output .bin path.",
     )
     parser.add_argument(
