@@ -191,8 +191,33 @@ def main():
     total_adj_words = 0.0
 
     pbar = tqdm(total=args.budget_words, desc="building multilingual bin", unit="adj_words")
-    while total_adj_words < args.budget_words:
-        lang = choose_language(adj_word_counts, target_adj_words)
+    langs = list(DEFAULT_RATIOS.keys())
+    eps = 1e-6
+    min_premium = min(BYTE_PREMIUM.get(l, 1.0) for l in langs)
+
+    while total_adj_words < args.budget_words - eps:
+        remaining_total_adj = args.budget_words - total_adj_words
+        # If we can't add even 1 raw word in any language, stop to avoid infinite loop.
+        if remaining_total_adj < (min_premium - eps):
+            break
+
+        feasible_langs = []
+        for l in langs:
+            prem = BYTE_PREMIUM.get(l, 1.0)
+            if prem <= 0:
+                continue
+            remaining_lang_adj = target_adj_words[l] - adj_word_counts[l]
+            remaining_adj = min(remaining_total_adj, max(remaining_lang_adj, 0.0))
+            if math.floor(remaining_adj / prem) >= 1:
+                feasible_langs.append(l)
+
+        if not feasible_langs:
+            break
+
+        lang = choose_language(
+            {l: adj_word_counts[l] for l in feasible_langs},
+            {l: target_adj_words[l] for l in feasible_langs},
+        )
         text = cursors[lang].next_text()
         raw_words = count_words(text, lang)
         if raw_words <= 0:
