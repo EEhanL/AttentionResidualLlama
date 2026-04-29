@@ -43,10 +43,24 @@ pip install -U torch numpy tqdm datasets sentencepiece transformers
 
 ## 1) 构建三语 `.bin`（zh/en/nl）
 
-该脚本会对三种语言分别循环取样、分词，并在每个样本末尾追加 `<eos>`，最终以 `uint16` token 序列写入 `.bin`。
+该脚本会对三种语言分别循环取样、按需截断、分词，并在每个样本末尾追加 `<eos>`，最终以 `uint16` token 序列写入 `.bin`。
 
-- **比例**：固定为 `zh:en:nl = 1:1:1`
-- **budget**：分词后 token 总数（包含 `<eos>`）
+### 计量规则（对齐 BabyLM multilingual track）
+
+- **总上限**：100M **words**（注意不是 100M tokens）
+- **byte premium（用于等效计量）**：
+  - English：`1.0`（基准）
+  - Dutch：`1.0516`
+  - Chinese：`0.9894`
+- **adjusted words 定义**：`adjusted_words = raw_words * byte_premium`
+- **三语等比例**：这里的 `zh:en:nl = 1:1:1` 指 **adjusted words** 占比相等（等效语义信息量一致），而不是 raw words 或 tokens 相等。
+
+### Word 计数与截断策略（保证不超过预算）
+
+- **English / Dutch**：用正则抽取类 word 片段计数；需要截断时按空白切分并保留前 N 个词。
+- **Chinese**：优先使用 `jieba` 分词计数与截断；若环境未安装 `jieba`，退化为按 CJK 汉字数近似计数/截断。
+
+脚本在接近预算上限时，会先按 word 边界截断文本，再做 SentencePiece 分词写入 `.bin`，从而 **严格保证**总 adjusted words 不超过 `--budget-words`。
 
 ```bash
 python build_multilingual_pretrain_bin.py \
@@ -54,11 +68,11 @@ python build_multilingual_pretrain_bin.py \
   --en-path ./data/babylm/eng_strict \
   --nl-path ./data/babylm/nld \
   --tokenizer-path ./chatglm_tokenizer/tokenizer.model \
-  --budget 100000000 \
+  --budget-words 100000000 \
   --output ./data/merged_multilingual_zh1_en1_nl1_100m.bin
 ```
 
-运行结束会打印每种语言的 token 数、文档数与占比。
+运行结束会打印每种语言的 token 数、raw words、adjusted words 与占比（`adj_share` 用于检查三语是否接近 1:1:1）。
 
 ---
 

@@ -6,6 +6,13 @@ import numpy as np
 from datasets import load_from_disk
 from sentencepiece import SentencePieceProcessor
 from tqdm import tqdm
+import re
+import math
+
+try:
+    import jieba  # optional, used for better Chinese word counting/truncation
+except Exception:  # pragma: no cover
+    jieba = None
 
 
 DEFAULT_SOURCES = {
@@ -19,6 +26,56 @@ DEFAULT_RATIOS = {
     "en": 1,
     "nl": 1,
 }
+
+BYTE_PREMIUM = {
+    # BabyLM multilingual track byte premium (English is baseline)
+    "en": 1.0,
+    "nl": 1.0516,
+    "zh": 0.9894,
+}
+
+_WORD_RE_LATIN = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def count_words(text: str, lang: str) -> int:
+    text = (text or "").strip()
+    if not text:
+        return 0
+
+    if lang in ("en", "nl"):
+        return len(_WORD_RE_LATIN.findall(text))
+
+    if lang == "zh":
+        if jieba is not None:
+            return sum(1 for t in jieba.cut(text, cut_all=False) if t.strip())
+        return len(_CJK_RE.findall(text))
+
+    return len([t for t in re.split(r"\s+", text) if t])
+
+
+def truncate_to_words(text: str, lang: str, max_words: int) -> str:
+    text = (text or "").strip()
+    if max_words <= 0 or not text:
+        return ""
+
+    if lang in ("en", "nl"):
+        parts = [t for t in re.split(r"\s+", text) if t]
+        if len(parts) <= max_words:
+            return text
+        return " ".join(parts[:max_words])
+
+    if lang == "zh":
+        if jieba is not None:
+            toks = [t for t in jieba.cut(text, cut_all=False) if t.strip()]
+            if len(toks) <= max_words:
+                return text
+            return "".join(toks[:max_words])
+        cjk = _CJK_RE.findall(text)
+        return "".join(cjk[:max_words])
+
+    parts = [t for t in re.split(r"\s+", text) if t]
+    return " ".join(parts[:max_words])
 
 
 class DatasetCursor:
@@ -42,7 +99,10 @@ class DatasetCursor:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build a multilingual BabyLM pretraining bin with fixed token ratios."
+        description=(
+            "Build a multilingual BabyLM pretraining bin under an adjusted-words budget "
+            "(100M words with byte premium)."
+        )
     )
     parser.add_argument(
         "--output",
@@ -50,10 +110,10 @@ def parse_args():
         help="Output .bin path.",
     )
     parser.add_argument(
-        "--budget",
+        "--budget-words",
         type=int,
         default=100_000_000,
-        help="Total token budget after tokenization, including <eos>.",
+        help="Total adjusted word budget (words * byte_premium).",
     )
     parser.add_argument(
         "--seed",
@@ -78,11 +138,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def choose_language(token_counts, target_counts):
-    remaining = {lang: target_counts[lang] - token_counts[lang] for lang in target_counts}
+def choose_language(adj_counts, target_adj):
+    remaining = {lang: target_adj[lang] - adj_counts[lang] for lang in target_adj}
     candidates = [lang for lang, left in remaining.items() if left > 0]
     if not candidates:
-        return max(target_counts, key=lambda lang: target_counts[lang] - token_counts[lang])
+        return max(target_adj, key=lambda lang: target_adj[lang] - adj_counts[lang])
     return max(candidates, key=lambda lang: remaining[lang])
 
 
@@ -116,37 +176,56 @@ def main():
     }
 
     ratio_sum = sum(DEFAULT_RATIOS.values())
-    target_counts = {
-        lang: int(args.budget * ratio / ratio_sum)
+    target_adj_words = {
+        lang: int(args.budget_words * ratio / ratio_sum)
         for lang, ratio in DEFAULT_RATIOS.items()
     }
-    target_counts["nl"] += args.budget - sum(target_counts.values())
+    target_adj_words["nl"] += args.budget_words - sum(target_adj_words.values())
 
+    adj_word_counts = {lang: 0.0 for lang in DEFAULT_RATIOS}
+    raw_word_counts = {lang: 0 for lang in DEFAULT_RATIOS}
     token_counts = {lang: 0 for lang in DEFAULT_RATIOS}
     doc_counts = {lang: 0 for lang in DEFAULT_RATIOS}
     token_buffer = []
     total_tokens = 0
+    total_adj_words = 0.0
 
-    pbar = tqdm(total=args.budget, desc="building multilingual bin", unit="tok")
-    while total_tokens < args.budget:
-        lang = choose_language(token_counts, target_counts)
+    pbar = tqdm(total=args.budget_words, desc="building multilingual bin", unit="adj_words")
+    while total_adj_words < args.budget_words:
+        lang = choose_language(adj_word_counts, target_adj_words)
         text = cursors[lang].next_text()
+        raw_words = count_words(text, lang)
+        if raw_words <= 0:
+            continue
+
+        premium = BYTE_PREMIUM.get(lang, 1.0)
+        remaining_total_adj = args.budget_words - total_adj_words
+        remaining_lang_adj = target_adj_words[lang] - adj_word_counts[lang]
+        remaining_adj = min(remaining_total_adj, max(remaining_lang_adj, 0.0))
+        max_raw_words = int(math.floor(remaining_adj / premium)) if premium > 0 else 0
+        if max_raw_words <= 0:
+            continue
+
+        if raw_words > max_raw_words:
+            text = truncate_to_words(text, lang, max_raw_words)
+            raw_words = count_words(text, lang)
+            if raw_words <= 0:
+                continue
+
         text_ids = sp.encode(text)
         if not text_ids:
             continue
         text_ids.append(eos_id)
 
-        remaining_total = args.budget - total_tokens
-        remaining_lang = target_counts[lang] - token_counts[lang]
-        allowed = min(len(text_ids), remaining_total, max(remaining_lang, 0))
-        if allowed <= 0:
-            continue
-
-        token_buffer.extend(text_ids[:allowed])
-        token_counts[lang] += allowed
+        token_buffer.extend(text_ids)
+        token_counts[lang] += len(text_ids)
         doc_counts[lang] += 1
-        total_tokens += allowed
-        pbar.update(allowed)
+        raw_word_counts[lang] += raw_words
+        adj_added = raw_words * premium
+        adj_word_counts[lang] += adj_added
+        total_adj_words += adj_added
+        total_tokens += len(text_ids)
+        pbar.update(adj_added)
 
         if len(token_buffer) >= args.buffer_tokens:
             flush_tokens(output_path, token_buffer)
@@ -156,11 +235,15 @@ def main():
 
     print(f"saved to: {output_path}")
     print(f"total tokens: {total_tokens}")
+    print(f"total adjusted words: {total_adj_words:.2f} (budget={args.budget_words})")
     for lang in ["zh", "en", "nl"]:
-        ratio = token_counts[lang] / max(total_tokens, 1)
+        token_share = token_counts[lang] / max(total_tokens, 1)
+        adj_share = adj_word_counts[lang] / max(total_adj_words, 1e-9)
         print(
             f"{lang}: tokens={token_counts[lang]} docs={doc_counts[lang]} "
-            f"share={ratio:.4f} dataset_passes={cursors[lang].epochs}"
+            f"token_share={token_share:.4f} raw_words={raw_word_counts[lang]} "
+            f"adj_words={adj_word_counts[lang]:.2f} adj_share={adj_share:.4f} "
+            f"dataset_passes={cursors[lang].epochs}"
         )
 
 

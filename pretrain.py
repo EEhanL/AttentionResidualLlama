@@ -171,7 +171,7 @@ def init_model():
 # I/O
 if __name__=="__main__":
     out_dir = 'out'
-    max_epoch = 1
+    max_epoch = 10
     eval_interval = 1
     log_interval = 100
     # log_interval = 1  # smoke run
@@ -275,7 +275,7 @@ if __name__=="__main__":
     #
     #-----init dataloader------
     data_path_list=[
-        './data/merged_multilingual_zh4_en3_nl3_100m.bin'
+        './data/merged_multilingual_zh1_en1_nl1_100m.bin'
         # './data/_smoke.bin'  # smoke run
         #'./data/baidubaike_563w.bin',
         #'./data/medical_book.bin',
