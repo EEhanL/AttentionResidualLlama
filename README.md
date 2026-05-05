@@ -133,7 +133,7 @@ torchrun --standalone --nproc_per_node=4 pretrain.py
 
 ```bash
 python hf_remote_code/convert_pth_to_hf.py \
-  --pth out/pretrain/epoch_0.pth \
+  --pth out/pretrain/best.pth \
   --out_dir out/hf_babylm_ckpt \
   --dim 512 --n_layers 8 --n_heads 8 --n_kv_heads 8 \
   --vocab_size 64793 --multiple_of 32 --max_seq_len 512 --dropout 0.0

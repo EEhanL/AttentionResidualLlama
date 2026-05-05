@@ -11,7 +11,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import PretrainDataset
 import logging
-from torch.utils.data import Subset
 
 # To run with DDP on 4 gpus on 1 node, example:
 # torchrun --standalone --nproc_per_node=4 pretrain.py OR python -m torch.distributed.launch --nproc_per_node=4 pretrain.py
@@ -203,7 +202,7 @@ def init_model():
 
 if __name__ == "__main__":
     out_dir = 'out'
-    max_epoch = 1
+    max_epoch = 10
 
     # validation / early stopping
     val_ratio = 0.03
@@ -227,6 +226,10 @@ if __name__ == "__main__":
     dropout = 0.0
     bias = False
 
+    # anti-plateau toggles
+    use_random_sampling_train = True
+    use_random_sampling_val = False
+
     learning_rate = 3e-4
     weight_decay = 1e-1
     beta1 = 0.9
@@ -240,7 +243,7 @@ if __name__ == "__main__":
 
     backend = 'nccl'
     device = 'cuda'
-    dtype = 'float16'
+    dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
     compile = False
 
     save_dir = os.path.join(out_dir, 'pretrain')
@@ -289,22 +292,46 @@ if __name__ == "__main__":
         './data/merged_multilingual_zh1_en1_nl1_100m.bin'
     ]
 
-    full_ds = PretrainDataset(data_path_list, max_length=max_seq_len, memmap=True)
-    full_len = len(full_ds)
-    val_len = max(1, int(full_len * val_ratio))
-    train_len = full_len - val_len
-    if train_len <= 0:
+    # split by token range on the same 100M bin
+    with open(data_path_list[0], 'rb') as f:
+        f.seek(0, 2)
+        total_tokens = f.tell() // np.dtype('uint16').itemsize
+
+    val_tokens = max(max_seq_len + 1, int(total_tokens * val_ratio))
+    train_tokens = total_tokens - val_tokens
+    if train_tokens <= max_seq_len:
         raise ValueError("val_ratio is too large, no data left for training")
 
-    # Deterministic split: train first part, val tail part
-    train_indices = np.arange(0, train_len)
-    val_indices = np.arange(train_len, full_len)
+    # align boundary for cleaner chunking
+    train_tokens = (train_tokens // max_seq_len) * max_seq_len
+    if train_tokens <= max_seq_len:
+        raise ValueError("train token range too small after alignment")
 
-    train_ds = Subset(full_ds, train_indices)
-    val_ds = Subset(full_ds, val_indices)
+    train_ds = PretrainDataset(
+        data_path_list,
+        max_length=max_seq_len,
+        memmap=True,
+        random_sampling=use_random_sampling_train,
+        start_token=0,
+        end_token=train_tokens,
+        seed=1337 + seed_offset,
+    )
+    val_ds = PretrainDataset(
+        data_path_list,
+        max_length=max_seq_len,
+        memmap=True,
+        random_sampling=use_random_sampling_val,
+        start_token=train_tokens,
+        end_token=total_tokens,
+        seed=1337,
+    )
 
     if master_process:
-        logger.info(f"Dataset split done. total={full_len}, train={train_len}, val={val_len}, val_ratio={val_ratio}")
+        logger.info(
+            f"Dataset split done. total_tokens={total_tokens}, train_tokens={train_tokens}, "
+            f"val_tokens={total_tokens - train_tokens}, val_ratio={val_ratio}, "
+            f"random_train={use_random_sampling_train}, random_val={use_random_sampling_val}"
+        )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True) if ddp else None
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds, shuffle=False) if ddp else None
