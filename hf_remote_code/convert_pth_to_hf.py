@@ -42,12 +42,28 @@ def _add_prefix(state: dict, prefix: str) -> dict:
 
 def _ensure_tied_embeddings(state: dict) -> dict:
     # Ensure both keys exist in the saved HF state dict.
+    # IMPORTANT: For weight tying, we only save tok_embeddings.weight once
+    # and let HF's tie_weights() handle the sharing at load time.
     tok_k = "model.tok_embeddings.weight"
     out_k = "model.output.weight"
-    if tok_k in state and out_k not in state:
-        state[out_k] = state[tok_k]
+    
+    # If both exist, remove output.weight to avoid duplication
+    # (they should be the same tensor due to weight tying in training)
+    if tok_k in state and out_k in state:
+        # Verify they are actually the same
+        if not torch.equal(state[tok_k], state[out_k]):
+            print("WARNING: tok_embeddings.weight and output.weight are different!")
+            print("This suggests weight tying was not properly applied during training.")
+        # Remove output.weight - HF will tie it automatically
+        del state[out_k]
+    elif tok_k in state and out_k not in state:
+        # Already correct - only tok_embeddings exists
+        pass
     elif out_k in state and tok_k not in state:
+        # Rename output.weight to tok_embeddings.weight
         state[tok_k] = state[out_k]
+        del state[out_k]
+    
     return state
 
 
@@ -66,6 +82,7 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--rms_norm_eps", type=float, default=1e-5)
 
+    ap.add_argument("--tokenizer_type", type=str, choices=["chatglm", "regex_bbpe"], default="chatglm")
     ap.add_argument("--bos_token_id", type=int, default=1)
     ap.add_argument("--eos_token_id", type=int, default=2)
     ap.add_argument("--pad_token_id", type=int, default=None)
@@ -79,23 +96,18 @@ def main() -> None:
     shutil.copy2(_HERE / "configuration_babyllama_kimi.py", out_dir / "configuration_babyllama_kimi.py")
     shutil.copy2(_HERE / "modeling_babyllama_kimi.py", out_dir / "modeling_babyllama_kimi.py")
 
-    # 2) Copy tokenizer implementation + assets (ChatGLMTokenizer)
-    _copy_tree(_REPO_ROOT / "chatglm_tokenizer", out_dir / "chatglm_tokenizer")
-    # Also place the SentencePiece model at the HF root dir as expected by ChatGLMTokenizer
-    sp_model_src = _REPO_ROOT / "chatglm_tokenizer" / "tokenizer.model"
-    sp_model_dst = out_dir / "tokenizer.model"
-    if sp_model_src.exists() and not sp_model_dst.exists():
-        shutil.copy2(sp_model_src, sp_model_dst)
-    # AutoTokenizer dynamic module loader expects "tokenization_xxx.ClassName" (one dot),
-    # so provide a root-level tokenization file.
-    tok_py_src = _REPO_ROOT / "chatglm_tokenizer" / "tokenization_chatglm.py"
-    tok_py_dst = out_dir / "tokenization_chatglm.py"
-    if tok_py_src.exists() and not tok_py_dst.exists():
-        shutil.copy2(tok_py_src, tok_py_dst)
+    # 2) Copy tokenizer assets by type
+    if args.tokenizer_type == "chatglm":
+        _copy_tree(_REPO_ROOT / "chatglm_tokenizer", out_dir / "chatglm_tokenizer")
+        sp_model_src = _REPO_ROOT / "chatglm_tokenizer" / "tokenizer.model"
+        sp_model_dst = out_dir / "tokenizer.model"
+        if sp_model_src.exists() and not sp_model_dst.exists():
+            shutil.copy2(sp_model_src, sp_model_dst)
+        tok_py_src = _REPO_ROOT / "chatglm_tokenizer" / "tokenization_chatglm.py"
+        tok_py_dst = out_dir / "tokenization_chatglm.py"
+        if tok_py_src.exists() and not tok_py_dst.exists():
+            shutil.copy2(tok_py_src, tok_py_dst)
 
-    # also copy tokenizer_config.json if present
-    if (_REPO_ROOT / "chatglm_tokenizer" / "tokenizer_config.json").exists():
-        # Create a root-level tokenizer_config.json so AutoTokenizer can resolve the class.
         tok_cfg = {
             "tokenizer_class": "ChatGLMTokenizer",
             "auto_map": {
@@ -106,6 +118,12 @@ def main() -> None:
             json.dumps(tok_cfg, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+    else:
+        _copy_tree(_REPO_ROOT / "tokenizer_regex_bbpe", out_dir / "tokenizer_regex_bbpe")
+        for fname in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
+            src = _REPO_ROOT / "tokenizer_regex_bbpe" / fname
+            if src.exists():
+                shutil.copy2(src, out_dir / fname)
 
     # 3) Build HF config with auto_map for trust_remote_code
     config = BabyLlamaKimiConfig(
@@ -123,13 +141,19 @@ def main() -> None:
         pad_token_id=args.pad_token_id,
     )
 
-    # tell Auto classes where to import from
-    config.auto_map = {
-        "AutoConfig": "configuration_babyllama_kimi.BabyLlamaKimiConfig",
-        "AutoModelForCausalLM": "modeling_babyllama_kimi.BabyLlamaKimiForCausalLM",
-        "AutoTokenizer": "chatglm_tokenizer.tokenization_chatglm.ChatGLMTokenizer",
-    }
-    config.tokenizer_class = "ChatGLMTokenizer"
+    if args.tokenizer_type == "chatglm":
+        config.auto_map = {
+            "AutoConfig": "configuration_babyllama_kimi.BabyLlamaKimiConfig",
+            "AutoModelForCausalLM": "modeling_babyllama_kimi.BabyLlamaKimiForCausalLM",
+            "AutoTokenizer": "chatglm_tokenizer.tokenization_chatglm.ChatGLMTokenizer",
+        }
+        config.tokenizer_class = "ChatGLMTokenizer"
+    else:
+        config.auto_map = {
+            "AutoConfig": "configuration_babyllama_kimi.BabyLlamaKimiConfig",
+            "AutoModelForCausalLM": "modeling_babyllama_kimi.BabyLlamaKimiForCausalLM",
+        }
+        config.tokenizer_class = "PreTrainedTokenizerFast"
 
     # 4) Low-memory export:
     # - do NOT instantiate the HF model

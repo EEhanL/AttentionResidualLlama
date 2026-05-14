@@ -8,6 +8,99 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.optim import Optimizer
+
+class Muon(Optimizer):
+    def __init__(self, params, lr=1e-4, momentum=0.95, weight_decay=0.0, ns_steps=5, eps=1e-8):
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps, eps=eps)
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def zeropower_via_newtonschulz5(g, steps, eps):
+        assert g.ndim >= 2
+        original_shape = g.shape
+        x = g.float().reshape(original_shape[0], -1)
+        transposed = x.size(0) > x.size(1)
+        if transposed:
+            x = x.T
+
+        norm = x.norm()
+        if norm < eps:
+            return torch.zeros_like(g)
+        x = x / (norm + eps)
+
+        a, b, c = 3.4445, -4.7750, 2.0315
+        for _ in range(steps):
+            xx_t = x @ x.T
+            x = a * x + (b * xx_t + c * xx_t @ xx_t) @ x
+
+        if transposed:
+            x = x.T
+        return x.reshape(original_shape).type_as(g)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            weight_decay = group["weight_decay"]
+            ns_steps = group["ns_steps"]
+            eps = group["eps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.ndim < 2:
+                    raise ValueError("Muon should only receive parameters with at least 2 dimensions.")
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(p)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(grad)
+                update = self.zeropower_via_newtonschulz5(buf, ns_steps, eps)
+                if weight_decay != 0:
+                    p.mul_(1 - lr * weight_decay)
+                p.add_(update, alpha=-lr)
+
+        return loss
+
+
+class MultiOptimizer:
+    def __init__(self, optimizers):
+        self.optimizers = optimizers
+        self.param_groups = [group for optimizer in optimizers for group in optimizer.param_groups]
+
+    def zero_grad(self, set_to_none=True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+    def state_dict(self):
+        return [optimizer.state_dict() for optimizer in self.optimizers]
+
+    def load_state_dict(self, state_dicts):
+        for optimizer, state_dict in zip(self.optimizers, state_dicts):
+            optimizer.load_state_dict(state_dict)
+
+
+def set_optimizer_lrs(optimizer, adamw_lr, muon_lr=None):
+    for param_group in optimizer.param_groups:
+        group_type = param_group.get("group_type", "adamw")
+        if group_type == "muon":
+            param_group["lr"] = muon_lr if muon_lr is not None else adamw_lr
+        else:
+            param_group["lr"] = adamw_lr
+
 
 @dataclass
 class ModelArgs:
@@ -347,31 +440,81 @@ class Transformer(nn.Module):
 
         return logits
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
+    def configure_optimizers(
+        self,
+        weight_decay,
+        learning_rate,
+        betas,
+        device_type,
+        optimizer_type="adamw",
+        muon_learning_rate=None,
+    ):
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
 
-        return optimizer
+        if optimizer_type == "adamw":
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay, 'group_type': 'adamw_decay'},
+                {'params': nodecay_params, 'weight_decay': 0.0, 'group_type': 'adamw_nodecay'},
+            ]
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed AdamW parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed AdamW parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            print(f"using fused AdamW: {use_fused}")
+            return optimizer
+
+        if optimizer_type != "muon":
+            raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")
+
+        muon_params = []
+        adamw_decay_params = []
+        adamw_nodecay_params = []
+        for name, param in param_dict.items():
+            is_muon_matrix = (
+                param.dim() == 2
+                and name.endswith(".weight")
+                and not name.startswith("tok_embeddings")
+                and not name.startswith("output")
+            )
+            if is_muon_matrix:
+                muon_params.append(param)
+            elif param.dim() >= 2:
+                adamw_decay_params.append(param)
+            else:
+                adamw_nodecay_params.append(param)
+
+        adamw_groups = [
+            {'params': adamw_decay_params, 'weight_decay': weight_decay, 'group_type': 'adamw_decay'},
+            {'params': adamw_nodecay_params, 'weight_decay': 0.0, 'group_type': 'adamw_nodecay'},
+        ]
+        adamw_optimizer = torch.optim.AdamW(adamw_groups, lr=learning_rate, betas=betas, **extra_args)
+
+        muon_lr = learning_rate if muon_learning_rate is None else muon_learning_rate
+        muon_optimizer = Muon(
+            [{'params': muon_params, 'weight_decay': weight_decay, 'group_type': 'muon'}],
+            lr=muon_lr,
+            momentum=0.95,
+            weight_decay=weight_decay,
+            ns_steps=5,
+        )
+
+        num_muon_params = sum(p.numel() for p in muon_params)
+        num_adamw_decay_params = sum(p.numel() for p in adamw_decay_params)
+        num_adamw_nodecay_params = sum(p.numel() for p in adamw_nodecay_params)
+        print(f"num Muon 2D matrix tensors: {len(muon_params)}, with {num_muon_params:,} parameters")
+        print(f"num decayed AdamW fallback tensors: {len(adamw_decay_params)}, with {num_adamw_decay_params:,} parameters")
+        print(f"num non-decayed AdamW fallback tensors: {len(adamw_nodecay_params)}, with {num_adamw_nodecay_params:,} parameters")
+        print(f"using fused AdamW fallback: {use_fused}")
+
+        return MultiOptimizer([adamw_optimizer, muon_optimizer])
 
     # def estimate_mfu(self, fwdbwd_per_iter, dt):
     #     """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """

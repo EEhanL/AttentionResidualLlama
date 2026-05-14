@@ -1,11 +1,12 @@
 import os
+import argparse
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import time
 import math
 from contextlib import nullcontext
 import numpy as np
 import torch
-from model import Transformer, ModelArgs
+from model import Transformer, ModelArgs, set_optimizer_lrs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -14,6 +15,80 @@ import logging
 
 # To run with DDP on 4 gpus on 1 node, example:
 # torchrun --standalone --nproc_per_node=4 pretrain.py OR python -m torch.distributed.launch --nproc_per_node=4 pretrain.py
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Pretrain BabyLlama with selectable tokenizer/vocab settings.")
+    parser.add_argument(
+        "--data-bin",
+        default="./data/merged_multilingual_zh1_en1_nl1_100m.bin",
+        help="Path to pretraining token bin file.",
+    )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=64793,
+        help="Model vocabulary size. Must match tokenizer vocab size.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default="out",
+        help="Base output directory.",
+    )
+    parser.add_argument(
+        "--cuda-visible-devices",
+        default=None,
+        help="Optional CUDA_VISIBLE_DEVICES override (e.g. '0,1,2,3').",
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=["adamw", "muon"],
+        default="adamw",
+        help="Use plain AdamW or Muon for selected 2D matrix parameters with AdamW fallback.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.05,
+        help="Dropout used in attention, residual, FFN and embedding paths.",
+    )
+    parser.add_argument(
+        "--max-epoch",
+        type=int,
+        default=10,
+        help="Maximum pretraining epochs. A shorter default is safer for the 100M-word BabyLM setting.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=2e-4,
+        help="AdamW/base learning rate.",
+    )
+    parser.add_argument(
+        "--muon-learning-rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate for Muon-managed 2D matrix parameters.",
+    )
+    parser.add_argument(
+        "--min-lr",
+        type=float,
+        default=1e-5,
+        help="Minimum AdamW/base learning rate after cosine decay.",
+    )
+    parser.add_argument(
+        "--muon-min-lr",
+        type=float,
+        default=5e-6,
+        help="Minimum Muon learning rate after cosine decay.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-1,
+        help="Weight decay for decayed AdamW parameters and Muon parameters.",
+    )
+    return parser.parse_args()
 
 
 def get_logger(filename, verbosity=1, name=None):
@@ -35,15 +110,17 @@ def get_logger(filename, verbosity=1, name=None):
 
 
 # -----------------------------------------------------------------------------
-def get_lr(it):
+def get_lr(it, base_lr=None, target_min_lr=None):
+    base_lr = learning_rate if base_lr is None else base_lr
+    target_min_lr = min_lr if target_min_lr is None else target_min_lr
     if it < warmup_iters:
-        return learning_rate * it / warmup_iters
+        return base_lr * it / warmup_iters
     if it > lr_decay_iters:
-        return min_lr
+        return target_min_lr
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (learning_rate - min_lr)
+    return target_min_lr + coeff * (base_lr - target_min_lr)
 
 
 def save_model(path):
@@ -102,8 +179,8 @@ def train_epoch(epoch, global_step, best_val_loss, no_improve_count):
         Y = Y.to(device)
 
         lr = get_lr(global_step) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        muon_lr_now = get_lr(global_step, muon_learning_rate, muon_min_lr) if decay_lr else muon_learning_rate
+        set_optimizer_lrs(optimizer, lr, muon_lr_now)
 
         if ddp:
             model.require_backward_grad_sync = 0 == gradient_accumulation_steps - 1
@@ -127,14 +204,15 @@ def train_epoch(epoch, global_step, best_val_loss, no_improve_count):
             if global_step % log_interval == 0 and master_process:
                 spend_time = time.time() - start_time
                 logger.info(
-                    'Epoch:[{}/{}]({}/{}) step:{} loss:{:.4f} lr:{:.7f} ETA:{}min'.format(
+                    'Epoch:[{}/{}]({}/{}) step:{} loss:{:.4f} adamw_lr:{:.7f} muon_lr:{:.7f} ETA:{}min'.format(
                         epoch,
                         max_epoch,
                         step,
                         iter_per_epoch,
                         global_step,
                         loss.item() * gradient_accumulation_steps,
-                        optimizer.param_groups[-1]['lr'],
+                        lr,
+                        muon_lr_now if args.optimizer == "muon" else 0.0,
                         spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     )
                 )
@@ -173,7 +251,7 @@ def init_model():
         n_layers=n_layers,
         n_heads=n_heads,
         n_kv_heads=n_heads,
-        vocab_size=64793,
+        vocab_size=args.vocab_size,
         multiple_of=multiple_of,
         max_seq_len=max_seq_len,
         dropout=dropout,
@@ -201,8 +279,12 @@ def init_model():
 
 
 if __name__ == "__main__":
-    out_dir = 'out'
-    max_epoch = 10
+    args = parse_args()
+    if args.cuda_visible_devices is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_visible_devices
+
+    out_dir = args.out_dir
+    max_epoch = args.max_epoch
 
     # validation / early stopping
     val_ratio = 0.03
@@ -223,15 +305,16 @@ if __name__ == "__main__":
     n_layers = 8
     n_heads = 8
     multiple_of = 32
-    dropout = 0.0
+    dropout = args.dropout
     bias = False
 
     # anti-plateau toggles
     use_random_sampling_train = True
     use_random_sampling_val = False
 
-    learning_rate = 3e-4
-    weight_decay = 1e-1
+    learning_rate = args.learning_rate
+    muon_learning_rate = args.muon_learning_rate
+    weight_decay = args.weight_decay
     beta1 = 0.9
     beta2 = 0.95
     grad_clip = 1.0
@@ -239,7 +322,8 @@ if __name__ == "__main__":
     decay_lr = True
     warmup_iters = 1000
     lr_decay_iters = 80000
-    min_lr = 1e-5
+    min_lr = args.min_lr
+    muon_min_lr = args.muon_min_lr
 
     backend = 'nccl'
     device = 'cuda'
@@ -289,7 +373,7 @@ if __name__ == "__main__":
     global_step = 0
 
     data_path_list = [
-        './data/merged_multilingual_zh1_en1_nl1_100m.bin'
+        args.data_bin
     ]
 
     # split by token range on the same 100M bin
@@ -359,7 +443,14 @@ if __name__ == "__main__":
     model.to(device)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    optimizer = model.configure_optimizers(
+        weight_decay,
+        learning_rate,
+        (beta1, beta2),
+        device_type,
+        optimizer_type=args.optimizer,
+        muon_learning_rate=muon_learning_rate,
+    )
 
     if compile:
         print("compiling the model... (takes a ~minute)")

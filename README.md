@@ -60,16 +60,33 @@ pip install -U torch numpy tqdm datasets sentencepiece transformers
 - **English / Dutch**：用正则抽取类 word 片段计数；需要截断时按空白切分并保留前 N 个词。
 - **Chinese**：优先使用 `jieba` 分词计数与截断；若环境未安装 `jieba`，退化为按 CJK 汉字数近似计数/截断。
 
-脚本在接近预算上限时，会先按 word 边界截断文本，再做 SentencePiece 分词写入 `.bin`，从而 **严格保证**总 adjusted words 不超过 `--budget-words`。
+脚本在接近预算上限时，会先按 word 边界截断文本，再做分词写入 `.bin`，从而 **严格保证**总 adjusted words 不超过 `--budget-words`。
+
+支持通过参数选择 tokenizer：
+
+- `--tokenizer-type chatglm`：使用 SentencePiece（`tokenizer.model`）
+- `--tokenizer-type regex_bbpe`：使用 `tokenizer_regex_bbpe/`（Transformers Fast tokenizer）
 
 ```bash
 python build_multilingual_pretrain_bin.py \
   --zh-path ./data/babylm/zho \
   --en-path ./data/babylm/eng_strict \
   --nl-path ./data/babylm/nld \
+  --tokenizer-type chatglm \
   --tokenizer-path ./chatglm_tokenizer/tokenizer.model \
   --budget-words 100000000 \
   --output ./data/merged_multilingual_zh1_en1_nl1_100m.bin
+```
+
+```bash
+python build_multilingual_pretrain_bin.py \
+  --zh-path ./data/babylm/zho \
+  --en-path ./data/babylm/eng_strict \
+  --nl-path ./data/babylm/nld \
+  --tokenizer-type regex_bbpe \
+  --tokenizer-path ./tokenizer_regex_bbpe \
+  --budget-words 100000000 \
+  --output ./data/merged_multilingual_regexbbpe_zh1_en1_nl1_100m.bin
 ```
 
 运行结束会打印每种语言的 token 数、raw words、adjusted words 与占比（`adj_share` 用于检查三语是否接近 1:1:1）。
@@ -92,25 +109,73 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 ### 数据输入与输出（默认）
 
-`pretrain.py` 内部默认读取：
-
-- `./data/merged_multilingual_zh4_en3_nl3_100m.bin`
+`pretrain.py` 默认从 `--data-bin` 读取数据（默认值：`./data/merged_multilingual_zh1_en1_nl1_100m.bin`）。
 
 并将 checkpoint 输出到：
 
 - `out/pretrain/iter_*.pth`
 - `out/pretrain/epoch_*.pth`
 
+另外可通过 `--vocab-size` 指定词表大小（必须与 tokenizer 一致）。
+
+当前预训练脚本保留 AdamW 作为默认优化器，并额外支持通过 `--optimizer muon` 启用 Muon。Muon 只接管 Transformer 内部的 2D 线性层权重矩阵；embedding/output 权重、RMSNorm、attention residual 的 `depth_query` 等参数仍由 AdamW fallback 更新。
+
+考虑到 BabyLM multilingual track 的 100M words 数据限制，默认正则化/训练长度调整为：
+
+- `--dropout 0.05`
+- `--max-epoch 5`
+- `--learning-rate 2e-4`
+- `--weight-decay 0.1`
+
+如需复现实验或对比旧设置，可以在命令行显式改回对应参数。
+
 ### 单卡（最稳妥）
 
+默认使用 AdamW：
+
 ```bash
-python pretrain.py
+python pretrain.py \
+  --data-bin ./data/merged_multilingual_zh1_en1_nl1_100m.bin \
+  --vocab-size 64793
+```
+
+使用 Muon（只用于 2D 线性矩阵，其余参数仍使用 AdamW）：
+
+```bash
+python pretrain.py \
+  --data-bin ./data/merged_multilingual_zh1_en1_nl1_100m.bin \
+  --vocab-size 64793 \
+  --optimizer muon \
+  --learning-rate 2e-4 \
+  --muon-learning-rate 1e-4 \
+  --dropout 0.05 \
+  --max-epoch 5
+```
+
+regex BBPE 词表示例：
+
+```bash
+python pretrain.py \
+  --data-bin ./data/merged_multilingual_regexbbpe_zh1_en1_nl1_100m.bin \
+  --vocab-size 16000 \
+  --optimizer muon \
+  --learning-rate 2e-4 \
+  --muon-learning-rate 1e-4 \
+  --dropout 0.05 \
+  --max-epoch 5
 ```
 
 ### 多卡 DDP（示例：4 卡）
 
 ```bash
-torchrun --standalone --nproc_per_node=4 pretrain.py
+torchrun --standalone --nproc_per_node=4 pretrain.py \
+  --data-bin ./data/merged_multilingual_zh1_en1_nl1_100m.bin \
+  --vocab-size 64793 \
+  --optimizer muon \
+  --learning-rate 2e-4 \
+  --muon-learning-rate 1e-4 \
+  --dropout 0.05 \
+  --max-epoch 5
 ```
 
 ---
@@ -124,19 +189,31 @@ torchrun --standalone --nproc_per_node=4 pretrain.py
 - `config.json`
 - `pytorch_model.bin`
 - `configuration_babyllama_kimi.py` / `modeling_babyllama_kimi.py`（remote code）
-- tokenizer 相关文件（包含 `tokenizer.model` 与 `tokenization_chatglm.py` 等）
+- tokenizer 相关文件（根据 `--tokenizer_type` 选择复制 chatglm 或 regex_bbpe 资源）
 
 ### 导出命令（以 `pretrain.py` 默认 92M 配置为例）
 
-`pretrain.py` 默认超参是：`dim=512, n_layers=8, n_heads=8, max_seq_len=512, vocab_size=64793, multiple_of=32, dropout=0.0`。  
-导出时必须与训练时一致。
+`pretrain.py` 默认超参是：`dim=512, n_layers=8, n_heads=8, max_seq_len=512, vocab_size=64793, multiple_of=32, dropout=0.05`。  
+导出时必须与训练时一致。如果训练时通过 `--dropout` 指定了其他值，导出命令里的 `--dropout` 也要同步修改。
 
 ```bash
 python hf_remote_code/convert_pth_to_hf.py \
   --pth out/pretrain/best.pth \
   --out_dir out/hf_babylm_ckpt \
+  --tokenizer_type chatglm \
   --dim 512 --n_layers 8 --n_heads 8 --n_kv_heads 8 \
-  --vocab_size 64793 --multiple_of 32 --max_seq_len 512 --dropout 0.0
+  --vocab_size 64793 --multiple_of 32 --max_seq_len 512 --dropout 0.05
+```
+
+若使用 regex bbpe（你当前目录下词表大小为 16000），可改为：
+
+```bash
+python hf_remote_code/convert_pth_to_hf.py \
+  --pth out/pretrain/best.pth \
+  --out_dir out/hf_babylm_ckpt_regexbbpe \
+  --tokenizer_type regex_bbpe \
+  --dim 512 --n_layers 8 --n_heads 8 --n_kv_heads 8 \
+  --vocab_size 16000 --multiple_of 32 --max_seq_len 512 --dropout 0.05
 ```
 
 ### HF 侧加载方式
@@ -158,8 +235,12 @@ model = AutoModelForCausalLM.from_pretrained("out/hf_babylm_ckpt", trust_remote_
 
 ### Q2：`pretrain.py` 想换 `.bin` 路径怎么办？
 
-当前路径写在 `pretrain.py` 的 `data_path_list` 里（默认是 `./data/merged_multilingual_zh4_en3_nl3_100m.bin`）。
+使用 `--data-bin` 指定路径即可，例如：
+
+```bash
+python pretrain.py --data-bin ./data/your_data.bin --vocab-size 16000
+```
 
 ### Q3：导出 HF 时需要哪些文件？
 
-`convert_pth_to_hf.py` 会自动把 `hf_remote_code/` 里的 modeling/config 文件，以及仓库根目录的 `chatglm_tokenizer/` 复制到导出目录；只要你的 `.pth` 路径与模型超参填写正确即可。
+`convert_pth_to_hf.py` 会自动把 `hf_remote_code/` 里的 modeling/config 文件，以及你选择的 tokenizer 目录（`chatglm_tokenizer/` 或 `tokenizer_regex_bbpe/`）复制到导出目录；只要 `.pth` 路径与模型超参填写正确即可。

@@ -212,6 +212,9 @@ class Transformer(nn.Module):
         self.layers = torch.nn.ModuleList([TransformerBlock(i, params) for i in range(params.n_layers)])
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        
+        # Weight tying: share embeddings with output projection
+        self.tok_embeddings.weight = self.output.weight
 
         freqs_cos, freqs_sin = precompute_freqs_cis(
             self.params.dim // self.params.n_heads,
@@ -264,7 +267,7 @@ class BabyLlamaKimiForCausalLM(PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"model.output.weight": "model.tok_embeddings.weight"}
 
     def __init__(self, config: BabyLlamaKimiConfig):
-        super().__init__(config)
+        super().__init__(config, **kwargs)
 
         args = ModelArgs(
             dim=config.hidden_size,
@@ -279,6 +282,8 @@ class BabyLlamaKimiForCausalLM(PreTrainedModel, GenerationMixin):
         )
         self.model = Transformer(args)
 
+        # Ensure weight tying is applied
+        self.tie_weights()
         self.post_init()
 
     def tie_weights(self, *args, **kwargs):
