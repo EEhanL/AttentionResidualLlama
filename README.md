@@ -80,7 +80,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 `pretrain.py` 内部默认读取：
 
-- `./data/merged_multilingual_zh4_en3_nl3_100m.bin`
+- `./data/merged_multilingual_zh1_en1_nl1_100m.bin`
 
 并将 checkpoint 输出到：
 
