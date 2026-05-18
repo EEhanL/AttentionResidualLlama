@@ -1,0 +1,25 @@
+{
+  "phase": "C",
+  "trial": 0,
+  "params": {
+    "optimizer": "muon",
+    "learning_rate": 0.00033593134259682985,
+    "weight_decay": 0.0866562884543819,
+    "dropout": 0.07456280904162788,
+    "muon_learning_rate": 0.00023754772812078492
+  },
+  "best_pth": "/root/autodl-tmp/AttentionResidualLlama/runs/optuna/phase_c/trial_0000/train_out/pretrain/best.pth",
+  "best_val_loss": 3.208976,
+  "metrics": {
+    "zeroshot_zho": 0.5394914950176949,
+    "blimp_zho": 0.6187853107344633,
+    "zeroshot_nld": 0.4918653350515464,
+    "blimp_nld": 0.6323333333333333,
+    "zeroshot_eng": 0.523589217940549,
+    "blimp_eng": 0.5619874739039666,
+    "avg_zeroshot": 0.5183153493365967,
+    "avg_blimp": 0.6043687059905878
+  },
+  "objective": 0.5183153493365967,
+  "status": "ok"
+}

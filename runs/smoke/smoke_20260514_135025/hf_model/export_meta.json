@@ -1,0 +1,4 @@
+{
+  "source_pth": "/root/autodl-tmp/AttentionResidualLlama/runs/smoke/smoke_20260514_135025/train_out/pretrain/best.pth",
+  "notes": "Exported with trust_remote_code=True custom model."
+}

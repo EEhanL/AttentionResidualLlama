@@ -1,0 +1,14 @@
+{
+  "phase": "A",
+  "trial": 11,
+  "params": {
+    "optimizer": "muon",
+    "learning_rate": 0.0005631594831345052,
+    "weight_decay": 0.11944515660112238,
+    "dropout": 0.002214329274389799,
+    "muon_learning_rate": 0.0002928913739497497
+  },
+  "best_pth": "/root/autodl-tmp/AttentionResidualLlama/runs/optuna/phase_a/trial_0011/train_out/pretrain/best.pth",
+  "best_val_loss": 3.534654,
+  "status": "ok"
+}

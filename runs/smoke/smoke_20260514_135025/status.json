@@ -1,0 +1,13 @@
+{
+  "run_name": "smoke_20260514_135025",
+  "project_root": "/root/autodl-tmp/AttentionResidualLlama",
+  "eval_root": "/root/autodl-tmp/babylm-eval/multilingual",
+  "train_out": "/root/autodl-tmp/AttentionResidualLlama/runs/smoke/smoke_20260514_135025/train_out",
+  "hf_out": "/root/autodl-tmp/AttentionResidualLlama/runs/smoke/smoke_20260514_135025/hf_model",
+  "started_at": "2026-05-14T14:28:28.363394",
+  "skip_pretrain": true,
+  "skip_convert": true,
+  "eval_rc": 0,
+  "status": "ok",
+  "finished_at": "2026-05-14T14:34:47.729230"
+}
