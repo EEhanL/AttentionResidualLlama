@@ -1,4 +1,0 @@
-{
-  "source_pth": "/root/autodl-tmp/AttentionResidualLlama/runs/optuna/phase_b/trial_0000/train_out/pretrain/best.pth",
-  "notes": "Exported with trust_remote_code=True custom model."
-}
